@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nano 33 Monitor - Epilepsy Guard</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Roboto, sans-serif;
+            margin: 0; padding: 0;
+            height: 100vh;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            transition: background-color 0.4s ease, color 0.4s ease;
+            background-color: #f4f4f9; 
+            text-align: center; 
+            color: #333;
+            overflow: hidden;
+        }
+
+        /* --- STĂRI VIZUALE --- */
+        body.monitoring { background-color: #e0e0e0; color: #333; }
+        body.pulse-warn { background-color: #FBC02D; color: #333; }
+        body.convulsii-warn { background-color: #FF9800; color: white; }
+        body.stopped { background-color: #2196F3; color: white; }
+        
+        body.fake-news { 
+            background-color: #4CAF50; 
+            color: white; 
+        }
+
+        body.critical-seizure { 
+            background-color: #D32F2F; 
+            color: white;
+            animation: redStrobe 0.5s infinite alternate;
+        }
+        
+        body.disconnected {
+            background-color: #607D8B;
+            color: white;
+        }
+
+        @keyframes redStrobe {
+            from { background-color: #D32F2F; transform: scale(1); }
+            to { background-color: #b71c1c; transform: scale(1.02); }
+        }
+
+        .container { padding: 20px; max-width: 90%; z-index: 10; }
+        h1 { font-size: 2.2rem; margin: 10px 0; text-transform: uppercase; letter-spacing: 1px; font-weight: 800; }
+        
+        #subText { font-size: 1.2rem; margin-bottom: 10px; font-weight: normal; }
+        #pulseText { font-size: 1.5rem; margin-bottom: 30px; font-weight: bold; min-height: 30px;}
+
+        .icon { font-size: 6rem; display: block; margin-bottom: 20px; transition: transform 0.3s ease; }
+        body.critical-seizure .icon { animation: shake 0.5s infinite; }
+        
+        @keyframes shake {
+            0% { transform: translate(1px, 1px) rotate(0deg); }
+            25% { transform: translate(-3px, 0px) rotate(1deg); }
+            50% { transform: translate(-1px, 2px) rotate(-1deg); }
+            75% { transform: translate(3px, 1px) rotate(-1deg); }
+            100% { transform: translate(1px, -2px) rotate(-1deg); }
+        }
+
+        .log { font-family: monospace; opacity: 0.5; margin-top: 40px; font-size: 0.8rem; }
+        button {
+            padding: 15px 40px; font-size: 1.1rem; border: none;
+            border-radius: 50px; cursor: pointer; background: #333; color: white;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2); 
+        }
+    </style>
+</head>
+<body class="">
+
+    <div class="container">
+        <div class="icon" id="icon">🔌</div>
+        <h1 id="mainText">Deconectat</h1>
+        
+        <p id="subText">Pornește senzorul și apasă Conectare</p>
+        <p id="pulseText">-- BPM</p>
+
+        <button id="btnConnect">Conectează Bluetooth</button>
+        <div class="log" id="logData">Stare: Așteptare...</div>
+    </div>
+
+    <script>
+        const serviceUUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
+        const charUUID    = "19b10001-e8f2-537e-4f6c-d104768a1214";
+
+        const btn = document.getElementById('btnConnect');
+        const mainText = document.getElementById('mainText');
+        const subText = document.getElementById('subText');
+        const pulseText = document.getElementById('pulseText'); 
+        const icon = document.getElementById('icon');
+        const body = document.body;
+
+        let isResetting = false; 
+        let wakeLock = null;
+
+        // --- AUDIO ---
+        let audioCtx;
+        let oscillator;
+        let gainNode;
+        let isAlarmPlaying = false;
+        let beepInterval;
+
+        function initAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        function startAlarm() {
+            if (isAlarmPlaying) return;
+            initAudio(); 
+            if(audioCtx.state === 'suspended') audioCtx.resume();
+
+            isAlarmPlaying = true;
+            oscillator = audioCtx.createOscillator();
+            gainNode = audioCtx.createGain();
+
+            oscillator.type = 'square'; 
+            oscillator.frequency.setValueAtTime(800, audioCtx.currentTime); 
+            oscillator.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.2);
+            oscillator.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 0.4);
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            oscillator.start();
+            
+            beepInterval = setInterval(() => {
+                if(gainNode && isAlarmPlaying) {
+                    const now = audioCtx.currentTime;
+                    gainNode.gain.setValueAtTime(0.5, now);
+                    gainNode.gain.setValueAtTime(0, now + 0.1); 
+                }
+            }, 200);
+        }
+
+        function stopAlarm() {
+            if (!isAlarmPlaying) return;
+            clearInterval(beepInterval);
+            if (oscillator) {
+                try { oscillator.stop(); } catch(e){}
+                oscillator.disconnect();
+            }
+            isAlarmPlaying = false;
+        }
+
+        async function requestWakeLock() {
+            try {
+                if ('wakeLock' in navigator) {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                }
+            } catch (err) { console.error(err); }
+        }
+
+        // --- BLUETOOTH ---
+        btn.addEventListener('click', async () => {
+            initAudio(); 
+            try {
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [serviceUUID] }]
+                });
+
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+
+                mainText.innerText = "Se conectează...";
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService(serviceUUID);
+                const characteristic = await service.getCharacteristic(charUUID);
+                await characteristic.startNotifications();
+                characteristic.addEventListener('characteristicvaluechanged', handleData);
+                
+                await requestWakeLock();
+                setStandbyMode();
+                btn.style.display = 'none';
+            } catch (error) {
+                console.error(error);
+                alert("Eroare: " + error);
+                onDisconnected(); 
+            }
+        });
+
+        function onDisconnected(event) {
+            console.log('Dispozitiv deconectat');
+            stopAlarm(); 
+            isResetting = false;
+
+            body.className = 'disconnected'; 
+            icon.innerText = "🔌";
+            mainText.innerText = "Conexiune Pierdută";
+            subText.innerText = "Verifică senzorul și reconectează.";
+            pulseText.innerText = "--";
+            
+            btn.style.display = 'inline-block';
+            document.getElementById('logData').innerText = "Stare: Deconectat";
+        }
+
+        function handleData(event) {
+            const decoder = new TextDecoder('utf-8');
+            const msg = decoder.decode(event.target.value).trim();
+            document.getElementById('logData').innerText = "Rx: " + msg;
+            updateUI(msg);
+        }
+
+        function setStandbyMode() {
+            body.className = 'monitoring';
+            icon.innerText = "🩺"; 
+            mainText.innerText = "MONITORIZARE ACTIVĂ";
+            subText.innerText = "Parametrii sunt în limite normale.";
+            pulseText.innerText = "-- BPM";
+            stopAlarm();
+        }
+
+        function updateUI(msg) {
+            
+            // --- PASUL 0: ACTUALIZĂM MEREU PULSUL DACĂ EXISTĂ ÎN MESAJ ---
+            // Asta asigură că pulsul apare și la CONVULSII, și la ALERTĂ, și la PB.
+            if (msg.includes("PULS")) {
+                let cleanMsg = msg.replace("PB.", "").replace("PULS", "").trim();
+                let bpm = parseFloat(cleanMsg);
+                
+                if (!isNaN(bpm) && bpm > 0) {
+                    pulseText.innerText = "❤️ " + bpm.toFixed(2) + " BPM";
+                }
+				else
+				{
+				pulseText.innerText = " ";
+				}
+            }
+
+            // --- PASUL 1: RESET ---
+            if (msg.includes("OFF")) {
+                isResetting = true;
+                body.className = 'stopped';
+                icon.innerText = "✅";
+                mainText.innerText = "ALARMA OPRITĂ";
+                subText.innerText = "Sistemul se resetează...";
+                pulseText.innerText = "--";
+                stopAlarm(); 
+
+                setTimeout(() => {
+                    isResetting = false;
+                    setStandbyMode();
+                }, 4000);
+                return; 
+            }
+
+            if (isResetting) return;
+
+            // --- PASUL 2: LOGICA DE CULORI (PRIORITĂȚI) ---
+
+            // A. ALARMĂ FALSĂ (Verde)
+            if (msg.includes("ALARMA FALSA")) {
+                body.className = 'fake-news';
+                icon.innerText = "🛡️";
+                mainText.innerText = "PACIENT STABIL";
+                subText.innerText = "Alarma falsă a fost anulată.";
+                stopAlarm();
+            }
+
+            // B. ALERTĂ CRITICĂ (Roșu)
+            else if (msg === "ALERTA") {
+                body.className = 'critical-seizure';
+                icon.innerText = "🔔";
+                mainText.innerText = "CRIZĂ EPILEPTICĂ";
+                subText.innerText = "PULS ANORMAL + CONVULSII!";
+                navigator.vibrate([500, 100, 500]); 
+                startAlarm();
+            }
+
+            // C. CONVULSII (Portocaliu)
+            else if (msg.includes("CONVULSII")) {
+                // Nu trecem pe portocaliu dacă suntem deja pe ROȘU
+                if (!body.classList.contains('critical-seizure')) {
+                    body.className = 'convulsii-warn';
+                    icon.innerText = "⚠️";
+                    mainText.innerText = "POSIBILE CONVULSII";
+                    subText.innerText = "Se detectează mișcări bruște.";
+                    navigator.vibrate(200);
+                    stopAlarm();
+                }
+            } 
+            
+            // D. PROBLEME PULS (Galben - doar dacă are "PB.")
+            else if (msg.includes("PB. PULS")) {
+                // Nu trecem pe galben dacă suntem pe ROȘU sau PORTOCALIU
+                if (!body.classList.contains('critical-seizure') && !body.classList.contains('convulsii-warn')) {
+                    body.className = 'pulse-warn'; 
+                    mainText.innerText = "PROBLEME PULS";
+                    subText.innerText = "Ritm cardiac anormal detectat.";
+                    icon.innerText = "❤️";
+                    stopAlarm();
+                }
+            }
+
+            // E. PULS NORMAL (Gri - doar dacă mesajul e simplu "PULS...")
+            else if (msg.includes("PULS") && !msg.includes("PB.")) {
+                // Revenim la Gri DOAR dacă eram pe Galben sau Verde.
+                // Dacă suntem pe Roșu sau Portocaliu, RĂMÂNEM acolo până se dă Reset sau Alarma Falsă.
+                if (body.classList.contains('pulse-warn') || body.classList.contains('fake-news') || body.classList.contains('monitoring')) {
+                    body.className = 'monitoring';
+                    icon.innerText = "🩺"; 
+                    mainText.innerText = "MONITORIZARE ACTIVĂ";
+                    subText.innerText = "Parametrii sunt în limite normale.";
+                    stopAlarm();
+                }
+            }
+        }
+    </script>
+</body>
+</html>
